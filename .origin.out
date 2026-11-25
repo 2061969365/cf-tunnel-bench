@@ -1,1 +1,0 @@
-{"tool": "cf-tunnel-bench", "version": "1.0.0", "listen": "127.0.0.1:18080", "token": "testtoken12345678", "healthz": "http://127.0.0.1:18080/testtoken12345678/healthz", "stream": "http://127.0.0.1:18080/testtoken12345678/stream"}
