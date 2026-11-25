@@ -1,0 +1,109 @@
+name: cf-tunnel-bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Tunnel URL including the path token; empty means the BENCH_URL secret"
+        required: false
+        default: ""
+      seconds:
+        description: "Seconds per sample"
+        required: false
+        default: "20"
+      streams:
+        description: "Comma-separated parallel stream counts"
+        required: false
+        default: "1,4,8"
+      reps:
+        description: "Repetitions per stream count"
+        required: false
+        default: "3"
+  # Enable once the device side has a stable hostname (see README, phase 2).
+  # schedule:
+  #   - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cf-tunnel-bench
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SECONDS_PER_SAMPLE: ${{ inputs.seconds || '20' }}
+      STREAMS: ${{ inputs.streams || '1,4,8' }}
+      REPS: ${{ inputs.reps || '3' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve target URL
+        env:
+          TUNNEL_URL: ${{ inputs.url != '' && inputs.url || secrets.BENCH_URL }}
+        run: |
+          set -eu
+          if [ -z "${TUNNEL_URL:-}" ]; then
+            echo "::error::No tunnel URL: set the BENCH_URL repository secret or pass the url input."
+            exit 1
+          fi
+          echo "::add-mask::$TUNNEL_URL"
+          echo "BENCH_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
+          echo "Target host: $(printf '%s' "$TUNNEL_URL" | sed -E 's#^[a-z]+://([^/]+).*#\1#')"
+
+      - name: Runner edge metadata
+        run: |
+          set -eu
+          mkdir -p out
+          curl -sS --max-time 20 "https://speed.cloudflare.com/meta" -o out/runner-meta.json || true
+          if [ -s out/runner-meta.json ]; then
+            jq -r '"asn=\(.asn) org=\(.asOrganization) colo=\(.colo) city=\(.city)"' \
+              out/runner-meta.json | tee out/runner-meta.txt || true
+          fi
+
+      - name: "Control B: runner -> Cloudflare edge (download)"
+        run: |
+          set -eu
+          python bench.py --edge-down \
+            --seconds "$SECONDS_PER_SAMPLE" --streams 4 --reps 2 --skip 3 \
+            --json out/control-edge-down.json --md out/control-edge-down.md
+
+      - name: "Main C: runner -> tunnel -> device (download)"
+        run: |
+          set -eu
+          python bench.py --url "$BENCH_URL" \
+            --seconds "$SECONDS_PER_SAMPLE" --streams "$STREAMS" --reps "$REPS" --skip 3 \
+            --warmup-seconds 4 \
+            --json out/tunnel.json --md out/tunnel.md
+
+      - name: Summary
+        if: always()
+        run: |
+          set -eu
+          {
+            echo "### cf-tunnel-bench · run $GITHUB_RUN_ID"
+            echo
+            if [ -f out/runner-meta.txt ]; then echo "Runner: $(cat out/runner-meta.txt)"; echo; fi
+            echo "Reading order: compare C (tunnel) against A (device uplink) and B (runner edge)."
+            echo "The end-to-end rate cannot exceed the slowest of A, B and the origin ceiling D."
+            echo
+            for f in out/control-edge-down.md out/tunnel.md; do
+              if [ -f "$f" ]; then cat "$f"; echo; fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.run_id }}-${{ github.run_attempt }}
+          path: out/
+          retention-days: 90
+          if-no-files-found: warn
