@@ -17,7 +17,8 @@
 | 代号 | 谁 → 谁 | 命令 | 作用 |
 |---|---|---|---|
 | **A** | 本机 → Cloudflare 边缘（上传） | `--edge-up` | 隧道上行段的硬天花板 |
-| **B** | runner → Cloudflare 边缘（下载） | `--edge-down` | 排除「runner 自己跑不动」 |
+| **B** | runner → 公网大文件（默认 Vultr LAX 1 GB） | `--url <mirror>` | 排除「runner 自己跑不动」 |
+| B′ | runner → Cloudflare 边缘 | `--edge-down` | 可选；机房 IP 常被 429 |
 | **C** | runner → 隧道 → 本机（下载） | `--url` | **主指标** |
 | **D** | 本机 → 127.0.0.1 origin | `--url http://127.0.0.1:PORT/...` | 排除 origin 成为瓶颈 |
 
@@ -60,11 +61,14 @@ gh workflow run bench.yml
 gh run watch
 ```
 
-跑完看 run 的 Summary：包含 runner 的 ASN/colo、控制项 B、主指标 C 的表格
+跑完看 run 的 Summary：包含 runner 的出口 IP/colo、控制项 B、主指标 C 的表格
 （1/4/8 并发 × 3 轮，p50/max/min/CV），完整样本在 artifact 里。
 
 参数（`workflow_dispatch`）：`url` 覆盖 secret、`seconds`（默认 20）、
 `streams`（默认 `1,4,8`）、`reps`（默认 3）。单次约 3–5 分钟。
+
+> Quick Tunnel 的 URL 每次重启都会变，`BENCH_URL` secret 需要跟着更新；
+> 用完可以 `gh secret delete BENCH_URL` 免得下次跑到一个失效地址。
 
 ## 两种接入方式
 
@@ -101,10 +105,33 @@ gh run watch
 也就是说：在这台机器当前的国际出口上，隧道下载的天花板大约就是 6 Mbps 量级，
 C 跑出来不会更高。换网络/换路径后再对比。
 
+## GitHub Actions 实测（2026-11-25，run 45548505572）
+
+runner 出口 `40.76.239.25`，CF colo `IAD`（美东）；quick tunnel，`protocol: http2`。
+
+| 项 | 1 流 | 4 流 | 8 流 |
+|---|---:|---:|---:|
+| B1 runner → Vultr LAX 1 GB | 570 Mbps | — | — |
+| B2 runner → CF 边缘 | 933 Mbps | — | — |
+| **C runner → 隧道 → 本机（p50）** | **1.7 Mbps**（max 4.6，cv 0.70） | **6.9 Mbps**（max 7.5，cv 0.25） | **5.5 Mbps**（max 5.9，cv 0.11） |
+
+读法：
+
+- 4 并发把速率从 ~1.7 拉到 ~7 Mbps，正好贴住本机 6.1 Mbps 的上行天花板
+  → **瓶颈是上行，不是隧道**。
+- 单流 0.7–4.6 Mbps 且 CV 0.70：单条 TCP 在 CN→US 长肥管道上被 BDP/丢包卡住，
+  多流才跑得满。`streams: 1,4,8` 这组参数就是为了把这个现象量出来。
+- 8 流反而略低于 4 流：CF 边缘 + connector 的多路复用与排队开销开始显现，
+  不是带宽不够。
+- B1/B2 在 500–900 Mbps：runner 侧不是瓶颈，C 的数字可信。
+
 ## 已知限制
 
 - GitHub hosted runner 全在境外 Azure，**测的是境外用户体验**。要国内视角，把
   `bench.py` 原样丢到国内 VPS 跑 `--url`，参数保持一致即可。
+- Cloudflare 的 `speed.cloudflare.com/__down` 对机房 IP 会返回 **429**（runner 实测
+  4 条流全 429），所以控制项 B 用公网大文件镜像；`--edge-down` 只作可选参考，
+  workflow 里已 `continue-on-error`。
 - 标准 runner 不能选区域，只能多跑几次覆盖不同落点、不同 colo（报告里记了 cf-ray）。
 - 单次传输约 1.5–2 GB 上行（50 Mbps × 20 s × 9 样本 + 对照）。免费 Tunnel 不适合
   持续大文件分发，别当 CDN 压；一天 ≤ 4 次足够。
